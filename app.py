@@ -41,15 +41,27 @@ def add_log(msg):
 # --- PROXY PARSER ---
 def parse_proxy(proxy_str):
     """
-    Parses proxy strings in various formats:
-    http://user:pass@host:port -> {'server': 'http://host:port', 'username': 'user', 'password': 'pass'}
-    host:port:user:pass -> {'server': 'http://host:port', 'username': 'user', 'password': 'pass'}
+    Enhanced Proxy Parser.
+    Handles:
+    - user:pass@host:port
+    - host:port:user:pass
+    - host:port
+    Automatically adds http:// if protocol is missing.
     """
     proxy_str = proxy_str.strip()
     if not proxy_str:
         return None
     
-    # Handle user:pass@host:port format
+    # Check for host:port:user:pass format first
+    parts = proxy_str.split(':')
+    if len(parts) == 4:
+        return {
+            "server": f"http://{parts[0]}:{parts[1]}",
+            "username": parts[2],
+            "password": parts[3]
+        }
+    
+    # Check for user:pass@host:port (or variations with/without http)
     regex = r"^(?:https?://)?(?:(?P<user>[^:]+):(?P<pass>[^@]+)@)?(?P<host>[^:]+):(?P<port>\d+)$"
     match = re.match(regex, proxy_str)
     
@@ -61,16 +73,12 @@ def parse_proxy(proxy_str):
             config["password"] = d['pass']
         return config
     
-    # Handle host:port:user:pass format (common in some providers)
-    parts = proxy_str.split(':')
-    if len(parts) == 4:
-        return {
-            "server": f"http://{parts[0]}:{parts[1]}",
-            "username": parts[2],
-            "password": parts[3]
-        }
+    # Fallback: Just assume it's host:port if it looks like it
+    if ":" in proxy_str:
+        clean_proxy = proxy_str if "://" in proxy_str else f"http://{proxy_str}"
+        return {"server": clean_proxy}
         
-    return {"server": proxy_str if proxy_str.startswith("http") else f"http://{proxy_str}"}
+    return None
 
 # --- CONFIGURATION & STYLING ---
 st.markdown("""
@@ -83,7 +91,7 @@ st.markdown("""
         color: #00ff00; 
         padding: 10px; 
         border-radius: 5px; 
-        font-size: 0.8rem;
+        font-size: 0.8rem; 
         max-height: 300px;
         overflow-y: auto;
     }
@@ -109,10 +117,9 @@ async def scrape_dubizzle(search_query, debug_mode=False, proxy_list=None):
         if proxy_config:
             add_log(f"Using Proxy Server: {proxy_config['server']}")
             if "username" in proxy_config:
-                add_log("Proxy authentication applied.")
+                add_log("Proxy credentials applied successfully.")
 
     async with async_playwright() as p:
-        # Launch with specific arguments
         browser = await p.chromium.launch(
             headless=True,
             proxy=proxy_config,
@@ -136,48 +143,43 @@ async def scrape_dubizzle(search_query, debug_mode=False, proxy_list=None):
         )
 
         page = await context.new_page()
-        # Hide automation
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         try:
-            add_log("Accessing homepage to set cookies...")
-            # We use a short timeout for the initial load to see if proxy works
+            add_log("Connecting via proxy and setting cookies...")
             response = await page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
-            add_log(f"Homepage Status: {response.status}")
+            add_log(f"Initial Connection Status: {response.status}")
             
             if response.status == 407:
-                add_log("CRITICAL: Proxy Authentication (407) failed. Check credentials format.")
-                st.error("Proxy Authentication Failed (407). Ensure format is http://user:pass@host:port")
+                add_log("CRITICAL: Proxy Authentication Required (407).")
+                st.error("Authentication failed. Please verify your proxy username and password.")
                 return pd.DataFrame(), None, "407 Error", 407, proxy_config
 
             await asyncio.sleep(random.uniform(1, 3))
 
-            add_log(f"Navigating to search results...")
+            add_log(f"Fetching search results...")
             response = await page.goto(search_url, wait_until="networkidle", timeout=45000)
             status_code = response.status
             add_log(f"Search Results Status: {status_code}")
 
-            # Screenshots are a common point of failure/timeout in cloud environments
             if debug_mode:
                 try:
-                    add_log("Attempting screenshot...")
-                    # animations=disabled and timeout=10000 prevents the font-loading hang
+                    add_log("Capturing visual state...")
                     screenshot_data = await page.screenshot(type="jpeg", quality=50, timeout=10000, animations="disabled")
-                    add_log("Screenshot captured.")
+                    add_log("Screenshot saved.")
                 except Exception as e:
-                    add_log(f"Screenshot failed (non-critical): {str(e)}")
+                    add_log(f"Screenshot skipped: {str(e)}")
 
-            # Check for block markers
             page_content = await page.content()
             if "Incapsula" in page_content or "incident_id" in page_content:
-                add_log("Incapsula Firewall active.")
+                add_log("Firewall Block detected in HTML content.")
             
             html_sample = page_content[:1000]
             
             soup = BeautifulSoup(page_content, 'html.parser')
             listings = soup.find_all('div', {'data-testid': 'listing-card'})
             
-            add_log(f"Found {len(listings)} potential deals.")
+            add_log(f"Parsed {len(listings)} items from the page.")
             
             for item in listings:
                 try:
@@ -186,24 +188,24 @@ async def scrape_dubizzle(search_query, debug_mode=False, proxy_list=None):
                     link_elem = item.find('a')
                     
                     if title_elem and price_elem:
-                        price = int(''.join(filter(str.isdigit, price_elem.text.strip())))
+                        price_val = int(''.join(filter(str.isdigit, price_elem.text.strip())))
                         raw_link = link_elem['href'] if link_elem else "#"
                         
                         results.append({
                             "Timestamp": pd.Timestamp.now(),
                             "Title": title_elem.text.strip(),
                             "Model": search_query,
-                            "Price": price,
+                            "Price": price_val,
                             "Location": item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "UAE",
                             "Link": raw_link if raw_link.startswith('http') else "https://uae.dubizzle.com" + raw_link
                         })
                 except: continue
                     
         except Exception as e:
-            add_log(f"CRITICAL ERROR: {str(e)}")
+            add_log(f"ERROR: {str(e)}")
         finally:
             await browser.close()
-            add_log("Browser sessions terminated.")
+            add_log("Browser closed.")
             
     return pd.DataFrame(results), screenshot_data, html_sample, status_code, proxy_config
 
@@ -228,8 +230,8 @@ def main():
     use_proxies = st.sidebar.toggle("Enable Proxies", value=True)
     proxies_raw = st.sidebar.text_area(
         "Proxy List (one per line)", 
-        placeholder="http://user:pass@host:port",
-        help="Format: http://username:password@ip:port"
+        placeholder="host:port:user:pass OR user:pass@host:port",
+        help="Paste your proxies here. The app will automatically clean the format."
     )
     
     proxy_list = [p.strip() for p in proxies_raw.split("\n") if p.strip()] if use_proxies else None
@@ -247,19 +249,19 @@ def main():
     
     if st.button("🔍 Scan Live Market", use_container_width=True):
         if not st.session_state.get('browser_installed'):
-            st.error("Browser not initialized.")
+            st.error("Wait for browser setup to complete.")
             return
 
-        with st.spinner("Executing stealth scan..."):
+        with st.spinner("Scanning..."):
             df_raw, screenshot, html_snippet, status, p_used = asyncio.run(scrape_dubizzle(category, debug_mode, proxy_list))
             
             if debug_mode:
                 with st.expander("🛠️ Debug Information"):
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.write(f"**Status:** {status}")
-                        if p_used: st.write(f"**Host:** {p_used['server']}")
-                        if screenshot: st.image(screenshot, caption="Last Page View")
+                        st.write(f"**HTTP Status:** {status}")
+                        if p_used: st.write(f"**Used Proxy:** {p_used['server']}")
+                        if screenshot: st.image(screenshot, caption="Last Scanned View")
                     with c2:
                         st.code(html_snippet, language="html")
 
@@ -283,9 +285,9 @@ def main():
                         cols[2].link_button("View Ad", row['Link'], use_container_width=True)
                         st.divider()
             else:
-                st.error("Scraper returned no items.")
+                st.error("No items found.")
                 if status == 407:
-                    st.warning("Authentication failed on your proxy. Check username/password.")
+                    st.warning("Authentication failed. Check your proxy list format.")
 
 if __name__ == "__main__":
     main()
