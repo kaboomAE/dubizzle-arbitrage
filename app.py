@@ -5,6 +5,7 @@ import plotly.express as px
 import asyncio
 import os
 import subprocess
+import random
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -15,6 +16,7 @@ st.set_page_config(page_title="Dubizzle Arbitrage Pro", layout="wide", page_icon
 # --- BROWSER INITIALIZATION FOR STREAMLIT CLOUD ---
 def install_playwright_browsers():
     try:
+        # Standard install
         subprocess.run(["playwright", "install", "chromium"], check=True)
         return True
     except Exception as e:
@@ -57,69 +59,107 @@ st.markdown("""
 # --- REAL SCRAPER ENGINE ---
 async def scrape_dubizzle(search_query, debug_mode=False):
     results = []
-    url = f"https://uae.dubizzle.com/en/classified/search/?q={search_query.replace(' ', '+')}"
+    # Base URL to establish cookies first
+    base_url = "https://uae.dubizzle.com/en/"
+    search_url = f"https://uae.dubizzle.com/en/classified/search/?q={search_query.replace(' ', '+')}"
     
-    add_log(f"Starting scrape for: {search_query}")
-    add_log(f"URL: {url}")
+    add_log(f"Starting Stealth Scrape for: {search_query}")
     
     screenshot_data = None
     html_sample = ""
     status_code = 0
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
+        # Launch with arguments to disable automation flags
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox'
+            ]
         )
+        
+        # Realistic User Agents
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ]
+
+        context = await browser.new_context(
+            user_agent=random.choice(user_agents),
+            viewport={'width': 1920, 'height': 1080},
+            java_script_enabled=True,
+            ignore_https_errors=True
+        )
+
         page = await context.new_page()
         
+        # Mask the webdriver property
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
         try:
-            add_log("Navigating to page...")
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # 1. First visit the homepage to solve initial JS challenges and get cookies
+            add_log("Establishing session on homepage...")
+            await page.goto(base_url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(random.uniform(2, 4))
+
+            # 2. Navigate to search URL
+            add_log(f"Navigating to search results...")
+            response = await page.goto(search_url, wait_until="networkidle", timeout=60000)
             status_code = response.status
             add_log(f"Response Status: {status_code}")
 
-            # Take a debug screenshot if needed
+            # 3. Handle possible Incapsula/Imperva delay
+            if "Incapsula" in await page.content():
+                add_log("Detected Incapsula challenge. Waiting for resolution...")
+                await asyncio.sleep(8) # Imperva challenges often refresh after 5-7 seconds
+
+            # Take debug screenshot
             if debug_mode:
-                screenshot_data = await page.screenshot(type="jpeg", quality=50)
+                screenshot_data = await page.screenshot(type="jpeg", quality=60)
                 add_log("Screenshot captured.")
 
-            # Wait for content or anti-bot
-            await asyncio.sleep(3)
+            # Scroll to trigger lazy loading and prove humanity
+            await page.mouse.wheel(0, 500)
+            await asyncio.sleep(2)
             
             content = await page.content()
-            html_sample = content[:1000] # Grab start of HTML for debugging
+            html_sample = content[:1500]
             
             soup = BeautifulSoup(content, 'html.parser')
             listings = soup.find_all('div', {'data-testid': 'listing-card'})
             
-            add_log(f"Found {len(listings)} listing cards via primary selector.")
+            add_log(f"Found {len(listings)} listings.")
             
             if not listings:
-                add_log("Attempting fallback selectors...")
-                listings = soup.select('div[class*="listing-card"]')
-                add_log(f"Found {len(listings)} cards via fallback.")
+                # Secondary fallback for grid view
+                listings = soup.select('div[class*="ListingCard"]')
+                add_log(f"Fallback check: Found {len(listings)} items.")
 
             for item in listings:
                 try:
-                    title_elem = item.find('h2', {'data-testid': 'listing-title'})
-                    price_elem = item.find('div', {'data-testid': 'listing-price'})
+                    title_elem = item.find('h2', {'data-testid': 'listing-title'}) or item.select_one('h2[class*="title"]')
+                    price_elem = item.find('div', {'data-testid': 'listing-price'}) or item.select_one('div[class*="price"]')
                     link_elem = item.find('a')
                     
                     if title_elem and price_elem:
                         price_text = price_elem.text.strip()
                         price = int(''.join(filter(str.isdigit, price_text)))
                         
+                        raw_link = link_elem['href'] if link_elem else "#"
+                        full_link = raw_link if raw_link.startswith('http') else "https://uae.dubizzle.com" + raw_link
+                        
                         results.append({
                             "Timestamp": pd.Timestamp.now(),
                             "Title": title_elem.text.strip(),
                             "Model": search_query,
                             "Price": price,
-                            "Location": item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "Unknown",
-                            "Link": "https://uae.dubizzle.com" + link_elem['href'] if not link_elem['href'].startswith('http') else link_elem['href']
+                            "Location": item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "Dubai",
+                            "Link": full_link
                         })
-                except Exception as e:
+                except Exception:
                     continue
                     
         except Exception as e:
@@ -134,7 +174,7 @@ async def scrape_dubizzle(search_query, debug_mode=False):
 # --- ARBITRAGE LOGIC ---
 def calculate_arbitrage(df):
     if df.empty: return df
-    filtered_df = df[df['Price'] > 50].copy()
+    filtered_df = df[df['Price'] > 100].copy() # Filter spam prices
     if filtered_df.empty: return df
     median = filtered_df['Price'].median()
     filtered_df['Market_Median'] = median
@@ -165,7 +205,7 @@ def main():
             st.warning("Browser not ready.")
             return
 
-        with st.spinner("Extracting live listings..."):
+        with st.spinner("Extracting live listings (Stealth Mode)..."):
             df_raw, screenshot, html_snippet, status = asyncio.run(scrape_dubizzle(category, debug_mode))
             
             if debug_mode:
@@ -174,9 +214,9 @@ def main():
                     with c1:
                         st.write(f"**HTTP Status:** {status}")
                         if screenshot:
-                            st.image(screenshot, caption="Scraper Visual Context", use_container_width=True)
+                            st.image(screenshot, caption="What the Scraper Sees", use_container_width=True)
                     with c2:
-                        st.write("**HTML Snippet (Top 1000 chars):**")
+                        st.write("**HTML Snippet:**")
                         st.code(html_snippet, language="html")
 
             if not df_raw.empty:
@@ -195,13 +235,13 @@ def main():
                     with st.container():
                         cols = st.columns([3, 1, 1])
                         cols[0].markdown(f"**{row['Title']}**\n\n📍 {row['Location']}")
-                        cols[1].markdown(f"💰 **AED {row['Price']:,}**\n\nROI: {row['ROI_%']:.1f}%")
-                        cols[2].link_button("View", row['Link'], use_container_width=True)
+                        cols[1].markdown(f"💰 **AED {row['Price']:,}**\n\n**ROI: {row['ROI_%']:.1f}%**")
+                        cols[2].link_button("View Ad", row['Link'], use_container_width=True)
                         st.divider()
             else:
                 st.error("Scraper returned no results.")
-                if status == 403:
-                    st.warning("Dubizzle is blocking this server's IP. You may need a residential proxy.")
+                if "Incapsula" in html_snippet:
+                    st.warning("Blocked by Imperva Firewall. Cloud IPs are currently restricted.")
 
 if __name__ == "__main__":
     main()
