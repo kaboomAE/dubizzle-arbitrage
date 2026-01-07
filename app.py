@@ -57,22 +57,33 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- REAL SCRAPER ENGINE ---
-async def scrape_dubizzle(search_query, debug_mode=False):
+async def scrape_dubizzle(search_query, debug_mode=False, proxy_list=None):
     results = []
-    # Base URL to establish cookies first
     base_url = "https://uae.dubizzle.com/en/"
     search_url = f"https://uae.dubizzle.com/en/classified/search/?q={search_query.replace(' ', '+')}"
     
-    add_log(f"Starting Stealth Scrape for: {search_query}")
+    add_log(f"Starting Proxy-Rotated Scrape for: {search_query}")
     
     screenshot_data = None
     html_sample = ""
     status_code = 0
+    used_proxy = None
+
+    # Determine proxy for this run
+    proxy_config = None
+    if proxy_list:
+        proxy_str = random.choice(proxy_list).strip()
+        if proxy_str:
+            # Expected format: http://user:pass@host:port or http://host:port
+            used_proxy = proxy_str
+            proxy_config = {"server": proxy_str}
+            add_log(f"Using Proxy: {used_proxy}")
 
     async with async_playwright() as p:
         # Launch with arguments to disable automation flags
         browser = await p.chromium.launch(
             headless=True,
+            proxy=proxy_config,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
@@ -112,9 +123,10 @@ async def scrape_dubizzle(search_query, debug_mode=False):
             add_log(f"Response Status: {status_code}")
 
             # 3. Handle possible Incapsula/Imperva delay
-            if "Incapsula" in await page.content():
+            page_text = await page.content()
+            if "Incapsula" in page_text or "incident_id" in page_text:
                 add_log("Detected Incapsula challenge. Waiting for resolution...")
-                await asyncio.sleep(8) # Imperva challenges often refresh after 5-7 seconds
+                await asyncio.sleep(8) 
 
             # Take debug screenshot
             if debug_mode:
@@ -169,7 +181,7 @@ async def scrape_dubizzle(search_query, debug_mode=False):
             await browser.close()
             add_log("Browser closed.")
             
-    return pd.DataFrame(results), screenshot_data, html_sample, status_code
+    return pd.DataFrame(results), screenshot_data, html_sample, status_code, used_proxy
 
 # --- ARBITRAGE LOGIC ---
 def calculate_arbitrage(df):
@@ -188,6 +200,17 @@ def main():
     category = st.sidebar.selectbox("Category", ["iPhone 15 Pro", "Rolex Submariner", "PS5 Console", "MacBook M3"])
     roi_threshold = st.sidebar.slider("Min ROI %", 0, 50, 10)
     
+    # Proxy Management
+    st.sidebar.subheader("🌐 Proxy Management")
+    use_proxies = st.sidebar.toggle("Use Proxies", value=False)
+    proxies_raw = st.sidebar.text_area(
+        "Proxy List (one per line)", 
+        placeholder="http://user:pass@host:port\nhttp://host2:port2",
+        help="Paste your proxies here. Each search will pick one at random."
+    )
+    
+    proxy_list = [p.strip() for p in proxies_raw.split("\n") if p.strip()] if use_proxies else None
+    
     debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=True)
     
     if debug_mode:
@@ -205,14 +228,15 @@ def main():
             st.warning("Browser not ready.")
             return
 
-        with st.spinner("Extracting live listings (Stealth Mode)..."):
-            df_raw, screenshot, html_snippet, status = asyncio.run(scrape_dubizzle(category, debug_mode))
+        with st.spinner("Extracting live listings..."):
+            df_raw, screenshot, html_snippet, status, used_p = asyncio.run(scrape_dubizzle(category, debug_mode, proxy_list))
             
             if debug_mode:
                 with st.expander("🛠️ Technical Debug View"):
                     c1, c2 = st.columns(2)
                     with c1:
                         st.write(f"**HTTP Status:** {status}")
+                        st.write(f"**Proxy Used:** {used_p if used_p else 'Direct IP (Cloud)'}")
                         if screenshot:
                             st.image(screenshot, caption="What the Scraper Sees", use_container_width=True)
                     with c2:
@@ -240,8 +264,8 @@ def main():
                         st.divider()
             else:
                 st.error("Scraper returned no results.")
-                if "Incapsula" in html_snippet:
-                    st.warning("Blocked by Imperva Firewall. Cloud IPs are currently restricted.")
+                if "Incapsula" in html_snippet or "incident_id" in html_snippet:
+                    st.warning("Blocked by Imperva Firewall. Please use high-quality residential proxies.")
 
 if __name__ == "__main__":
     main()
