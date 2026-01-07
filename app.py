@@ -16,6 +16,7 @@ def install_playwright_browsers():
     """
     try:
         # Check if chromium is already available
+        # Using --with-deps to ensure all Linux system libraries are present
         subprocess.run(["playwright", "install", "chromium"], check=True)
         return True
     except Exception as e:
@@ -160,7 +161,8 @@ def main():
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Items Scanned", len(df))
                 m2.metric("Hot Deals Found", len(deals))
-                m3.metric("Market Median", f"AED {df['Market_Median'].iloc[0]:,.0f}" if not df.empty else "N/A")
+                if not df.empty:
+                    m3.metric("Market Median", f"AED {df['Market_Median'].iloc[0]:,.0f}")
                 
                 # Visuals
                 col_left, col_right = st.columns([2, 1])
