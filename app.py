@@ -8,6 +8,9 @@ import subprocess
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
+# --- 1. MUST BE THE ABSOLUTE FIRST STREAMLIT COMMAND ---
+st.set_page_config(page_title="Dubizzle Arbitrage Pro", layout="wide", page_icon="🚀")
+
 # --- BROWSER INITIALIZATION FOR STREAMLIT CLOUD ---
 def install_playwright_browsers():
     """
@@ -20,7 +23,9 @@ def install_playwright_browsers():
         subprocess.run(["playwright", "install", "chromium"], check=True)
         return True
     except Exception as e:
-        st.error(f"Error installing browser binaries: {e}")
+        # Note: Using print here because st.error might fail if called too early 
+        # or in some contexts before page setup is finalized
+        print(f"Error installing browser binaries: {e}")
         return False
 
 # Run installation once per session
@@ -30,8 +35,6 @@ if 'browser_installed' not in st.session_state:
             st.session_state.browser_installed = True
 
 # --- CONFIGURATION & STYLING ---
-st.set_page_config(page_title="Dubizzle Arbitrage Pro", layout="wide", page_icon="🚀")
-
 st.markdown("""
     <style>
     .main { background-color: #f8f9fa; }
