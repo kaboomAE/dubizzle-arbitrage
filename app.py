@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import random
+import re
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -16,7 +17,6 @@ st.set_page_config(page_title="Dubizzle Arbitrage Pro", layout="wide", page_icon
 # --- BROWSER INITIALIZATION FOR STREAMLIT CLOUD ---
 def install_playwright_browsers():
     try:
-        # Standard install
         subprocess.run(["playwright", "install", "chromium"], check=True)
         return True
     except Exception as e:
@@ -35,8 +35,42 @@ if 'debug_logs' not in st.session_state:
 def add_log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     st.session_state.debug_logs.append(f"[{timestamp}] {msg}")
-    if len(st.session_state.debug_logs) > 20:
+    if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs.pop(0)
+
+# --- PROXY PARSER ---
+def parse_proxy(proxy_str):
+    """
+    Parses proxy strings in various formats:
+    http://user:pass@host:port -> {'server': 'http://host:port', 'username': 'user', 'password': 'pass'}
+    host:port:user:pass -> {'server': 'http://host:port', 'username': 'user', 'password': 'pass'}
+    """
+    proxy_str = proxy_str.strip()
+    if not proxy_str:
+        return None
+    
+    # Handle user:pass@host:port format
+    regex = r"^(?:https?://)?(?:(?P<user>[^:]+):(?P<pass>[^@]+)@)?(?P<host>[^:]+):(?P<port>\d+)$"
+    match = re.match(regex, proxy_str)
+    
+    if match:
+        d = match.groupdict()
+        config = {"server": f"http://{d['host']}:{d['port']}"}
+        if d['user'] and d['pass']:
+            config["username"] = d['user']
+            config["password"] = d['pass']
+        return config
+    
+    # Handle host:port:user:pass format (common in some providers)
+    parts = proxy_str.split(':')
+    if len(parts) == 4:
+        return {
+            "server": f"http://{parts[0]}:{parts[1]}",
+            "username": parts[2],
+            "password": parts[3]
+        }
+        
+    return {"server": proxy_str if proxy_str.startswith("http") else f"http://{proxy_str}"}
 
 # --- CONFIGURATION & STYLING ---
 st.markdown("""
@@ -50,7 +84,7 @@ st.markdown("""
         padding: 10px; 
         border-radius: 5px; 
         font-size: 0.8rem;
-        max-height: 200px;
+        max-height: 300px;
         overflow-y: auto;
     }
     </style>
@@ -62,131 +96,121 @@ async def scrape_dubizzle(search_query, debug_mode=False, proxy_list=None):
     base_url = "https://uae.dubizzle.com/en/"
     search_url = f"https://uae.dubizzle.com/en/classified/search/?q={search_query.replace(' ', '+')}"
     
-    add_log(f"Starting Proxy-Rotated Scrape for: {search_query}")
+    add_log(f"Starting Scrape for: {search_query}")
     
     screenshot_data = None
     html_sample = ""
     status_code = 0
-    used_proxy = None
-
-    # Determine proxy for this run
     proxy_config = None
+
     if proxy_list:
-        proxy_str = random.choice(proxy_list).strip()
-        if proxy_str:
-            # Expected format: http://user:pass@host:port or http://host:port
-            used_proxy = proxy_str
-            proxy_config = {"server": proxy_str}
-            add_log(f"Using Proxy: {used_proxy}")
+        raw_proxy = random.choice(proxy_list)
+        proxy_config = parse_proxy(raw_proxy)
+        if proxy_config:
+            add_log(f"Using Proxy Server: {proxy_config['server']}")
+            if "username" in proxy_config:
+                add_log("Proxy authentication applied.")
 
     async with async_playwright() as p:
-        # Launch with arguments to disable automation flags
+        # Launch with specific arguments
         browser = await p.chromium.launch(
             headless=True,
             proxy=proxy_config,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
-                '--disable-setuid-sandbox'
+                '--disable-setuid-sandbox',
+                '--disable-web-security'
             ]
         )
         
-        # Realistic User Agents
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         ]
 
         context = await browser.new_context(
             user_agent=random.choice(user_agents),
-            viewport={'width': 1920, 'height': 1080},
-            java_script_enabled=True,
-            ignore_https_errors=True
+            viewport={'width': 1280, 'height': 800},
+            java_script_enabled=True
         )
 
         page = await context.new_page()
-        
-        # Mask the webdriver property
+        # Hide automation
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         try:
-            # 1. First visit the homepage to solve initial JS challenges and get cookies
-            add_log("Establishing session on homepage...")
-            await page.goto(base_url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(random.uniform(2, 4))
+            add_log("Accessing homepage to set cookies...")
+            # We use a short timeout for the initial load to see if proxy works
+            response = await page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+            add_log(f"Homepage Status: {response.status}")
+            
+            if response.status == 407:
+                add_log("CRITICAL: Proxy Authentication (407) failed. Check credentials format.")
+                st.error("Proxy Authentication Failed (407). Ensure format is http://user:pass@host:port")
+                return pd.DataFrame(), None, "407 Error", 407, proxy_config
 
-            # 2. Navigate to search URL
+            await asyncio.sleep(random.uniform(1, 3))
+
             add_log(f"Navigating to search results...")
-            response = await page.goto(search_url, wait_until="networkidle", timeout=60000)
+            response = await page.goto(search_url, wait_until="networkidle", timeout=45000)
             status_code = response.status
-            add_log(f"Response Status: {status_code}")
+            add_log(f"Search Results Status: {status_code}")
 
-            # 3. Handle possible Incapsula/Imperva delay
-            page_text = await page.content()
-            if "Incapsula" in page_text or "incident_id" in page_text:
-                add_log("Detected Incapsula challenge. Waiting for resolution...")
-                await asyncio.sleep(8) 
-
-            # Take debug screenshot
+            # Screenshots are a common point of failure/timeout in cloud environments
             if debug_mode:
-                screenshot_data = await page.screenshot(type="jpeg", quality=60)
-                add_log("Screenshot captured.")
+                try:
+                    add_log("Attempting screenshot...")
+                    # animations=disabled and timeout=10000 prevents the font-loading hang
+                    screenshot_data = await page.screenshot(type="jpeg", quality=50, timeout=10000, animations="disabled")
+                    add_log("Screenshot captured.")
+                except Exception as e:
+                    add_log(f"Screenshot failed (non-critical): {str(e)}")
 
-            # Scroll to trigger lazy loading and prove humanity
-            await page.mouse.wheel(0, 500)
-            await asyncio.sleep(2)
+            # Check for block markers
+            page_content = await page.content()
+            if "Incapsula" in page_content or "incident_id" in page_content:
+                add_log("Incapsula Firewall active.")
             
-            content = await page.content()
-            html_sample = content[:1500]
+            html_sample = page_content[:1000]
             
-            soup = BeautifulSoup(content, 'html.parser')
+            soup = BeautifulSoup(page_content, 'html.parser')
             listings = soup.find_all('div', {'data-testid': 'listing-card'})
             
-            add_log(f"Found {len(listings)} listings.")
+            add_log(f"Found {len(listings)} potential deals.")
             
-            if not listings:
-                # Secondary fallback for grid view
-                listings = soup.select('div[class*="ListingCard"]')
-                add_log(f"Fallback check: Found {len(listings)} items.")
-
             for item in listings:
                 try:
-                    title_elem = item.find('h2', {'data-testid': 'listing-title'}) or item.select_one('h2[class*="title"]')
-                    price_elem = item.find('div', {'data-testid': 'listing-price'}) or item.select_one('div[class*="price"]')
+                    title_elem = item.find('h2', {'data-testid': 'listing-title'})
+                    price_elem = item.find('div', {'data-testid': 'listing-price'})
                     link_elem = item.find('a')
                     
                     if title_elem and price_elem:
-                        price_text = price_elem.text.strip()
-                        price = int(''.join(filter(str.isdigit, price_text)))
-                        
+                        price = int(''.join(filter(str.isdigit, price_elem.text.strip())))
                         raw_link = link_elem['href'] if link_elem else "#"
-                        full_link = raw_link if raw_link.startswith('http') else "https://uae.dubizzle.com" + raw_link
                         
                         results.append({
                             "Timestamp": pd.Timestamp.now(),
                             "Title": title_elem.text.strip(),
                             "Model": search_query,
                             "Price": price,
-                            "Location": item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "Dubai",
-                            "Link": full_link
+                            "Location": item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "UAE",
+                            "Link": raw_link if raw_link.startswith('http') else "https://uae.dubizzle.com" + raw_link
                         })
-                except Exception:
-                    continue
+                except: continue
                     
         except Exception as e:
             add_log(f"CRITICAL ERROR: {str(e)}")
-            st.error(f"Scraper Error: {e}")
         finally:
             await browser.close()
-            add_log("Browser closed.")
+            add_log("Browser sessions terminated.")
             
-    return pd.DataFrame(results), screenshot_data, html_sample, status_code, used_proxy
+    return pd.DataFrame(results), screenshot_data, html_sample, status_code, proxy_config
 
 # --- ARBITRAGE LOGIC ---
 def calculate_arbitrage(df):
     if df.empty: return df
-    filtered_df = df[df['Price'] > 100].copy() # Filter spam prices
+    filtered_df = df[df['Price'] > 100].copy()
     if filtered_df.empty: return df
     median = filtered_df['Price'].median()
     filtered_df['Market_Median'] = median
@@ -196,28 +220,26 @@ def calculate_arbitrage(df):
 
 # --- UI MAIN ---
 def main():
-    st.sidebar.title("🔧 Settings & Debug")
+    st.sidebar.title("🔧 Arbitrage Settings")
     category = st.sidebar.selectbox("Category", ["iPhone 15 Pro", "Rolex Submariner", "PS5 Console", "MacBook M3"])
-    roi_threshold = st.sidebar.slider("Min ROI %", 0, 50, 10)
+    roi_threshold = st.sidebar.slider("Min ROI % Filter", 0, 50, 10)
     
-    # Proxy Management
-    st.sidebar.subheader("🌐 Proxy Management")
-    use_proxies = st.sidebar.toggle("Use Proxies", value=False)
+    st.sidebar.subheader("🌐 Proxy Settings")
+    use_proxies = st.sidebar.toggle("Enable Proxies", value=True)
     proxies_raw = st.sidebar.text_area(
         "Proxy List (one per line)", 
-        placeholder="http://user:pass@host:port\nhttp://host2:port2",
-        help="Paste your proxies here. Each search will pick one at random."
+        placeholder="http://user:pass@host:port",
+        help="Format: http://username:password@ip:port"
     )
     
     proxy_list = [p.strip() for p in proxies_raw.split("\n") if p.strip()] if use_proxies else None
-    
     debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=True)
     
     if debug_mode:
-        st.sidebar.subheader("Live Logs")
+        st.sidebar.subheader("Terminal Output")
         log_text = "\n".join(st.session_state.debug_logs)
         st.sidebar.markdown(f'<div class="debug-log">{log_text}</div>', unsafe_allow_html=True)
-        if st.sidebar.button("Clear Logs"):
+        if st.sidebar.button("Clear History"):
             st.session_state.debug_logs = []
             st.rerun()
 
@@ -225,22 +247,20 @@ def main():
     
     if st.button("🔍 Scan Live Market", use_container_width=True):
         if not st.session_state.get('browser_installed'):
-            st.warning("Browser not ready.")
+            st.error("Browser not initialized.")
             return
 
-        with st.spinner("Extracting live listings..."):
-            df_raw, screenshot, html_snippet, status, used_p = asyncio.run(scrape_dubizzle(category, debug_mode, proxy_list))
+        with st.spinner("Executing stealth scan..."):
+            df_raw, screenshot, html_snippet, status, p_used = asyncio.run(scrape_dubizzle(category, debug_mode, proxy_list))
             
             if debug_mode:
-                with st.expander("🛠️ Technical Debug View"):
+                with st.expander("🛠️ Debug Information"):
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.write(f"**HTTP Status:** {status}")
-                        st.write(f"**Proxy Used:** {used_p if used_p else 'Direct IP (Cloud)'}")
-                        if screenshot:
-                            st.image(screenshot, caption="What the Scraper Sees", use_container_width=True)
+                        st.write(f"**Status:** {status}")
+                        if p_used: st.write(f"**Host:** {p_used['server']}")
+                        if screenshot: st.image(screenshot, caption="Last Page View")
                     with c2:
-                        st.write("**HTML Snippet:**")
                         st.code(html_snippet, language="html")
 
             if not df_raw.empty:
@@ -254,7 +274,7 @@ def main():
                 
                 st.plotly_chart(px.histogram(df, x="Price", title="Price Distribution"), use_container_width=True)
                 
-                st.subheader("🔥 Best Opportunities")
+                st.subheader("🔥 Top Deals")
                 for _, row in deals.iterrows():
                     with st.container():
                         cols = st.columns([3, 1, 1])
@@ -263,9 +283,9 @@ def main():
                         cols[2].link_button("View Ad", row['Link'], use_container_width=True)
                         st.divider()
             else:
-                st.error("Scraper returned no results.")
-                if "Incapsula" in html_snippet or "incident_id" in html_snippet:
-                    st.warning("Blocked by Imperva Firewall. Please use high-quality residential proxies.")
+                st.error("Scraper returned no items.")
+                if status == 407:
+                    st.warning("Authentication failed on your proxy. Check username/password.")
 
 if __name__ == "__main__":
     main()
