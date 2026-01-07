@@ -2,9 +2,28 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from scipy import stats
-import time
+import asyncio
+import os
 import random
+from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
+
+# --- BROWSER INITIALIZATION FOR STREAMLIT CLOUD ---
+def install_playwright():
+    """Ensures playwright browsers are installed on the Streamlit server."""
+    try:
+        import playwright
+    except ImportError:
+        os.system("pip install playwright")
+    
+    # This command installs chromium specifically for the Linux environment
+    os.system("playwright install chromium")
+
+# Run installation only once per session
+if 'browser_installed' not in st.session_state:
+    with st.spinner("Installing browser dependencies... this may take a minute on first run."):
+        install_playwright()
+        st.session_state.browser_installed = True
 
 # --- CONFIGURATION & STYLING ---
 st.set_page_config(page_title="Dubizzle Arbitrage Pro", layout="wide", page_icon="🚀")
@@ -24,132 +43,115 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- MOCK DATA GENERATOR (Simulating Scraper Engine) ---
-# In a production environment, this function would call Playwright/BS4
-def get_mock_dubizzle_data(category):
-    models = {
-        "iPhone": ["iPhone 15 Pro", "iPhone 15 Pro Max", "iPhone 14", "iPhone 13"],
-        "Luxury Watches": ["Rolex Submariner", "Omega Speedmaster", "Tag Heuer Carrera"],
-        "Gaming": ["PS5 Console", "Xbox Series X", "Gaming PC RTX 4080"]
-    }
+# --- REAL SCRAPER ENGINE ---
+async def scrape_dubizzle(search_query):
+    """
+    Actual scraper using Playwright. 
+    Note: Real-world use requires residential proxies for high volume.
+    """
+    results = []
+    url = f"https://uae.dubizzle.com/en/classified/search/?q={search_query.replace(' ', '+')}"
     
-    current_models = models.get(category, ["Generic Item"])
-    data = []
-    
-    # Establish a "True Market Value" for simulations
-    market_bases = {
-        "iPhone 15 Pro": 3200, "iPhone 15 Pro Max": 3800, "iPhone 14": 2000, 
-        "Rolex Submariner": 45000, "Omega Speedmaster": 18000,
-        "PS5 Console": 1600, "Gaming PC RTX 4080": 7500
-    }
-
-    for _ in range(30):
-        item_name = random.choice(current_models)
-        base = market_bases.get(item_name, 1000)
-        # Create a range of prices (some high, some low, most near base)
-        price = int(np.random.normal(base, base * 0.15))
+    async with async_playwright() as p:
+        # Launching in headless mode is mandatory for Streamlit Cloud
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
         
-        data.append({
-            "Title": f"{item_name} - {'Excellent' if price > base else 'Urgent Sale'}",
-            "Model": item_name,
-            "Price": max(price, 100), # Min price 100
-            "Location": random.choice(["Dubai Marina", "Business Bay", "Deira", "JLT", "Abu Dhabi"]),
-            "Link": "https://uae.dubizzle.com/search/"
-        })
-    return pd.DataFrame(data)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            content = await page.content()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Selectors based on Dubizzle's 2025/2026 layout
+            listings = soup.find_all('div', {'data-testid': 'listing-card'})
+            
+            for item in listings:
+                try:
+                    title = item.find('h2', {'data-testid': 'listing-title'}).text.strip()
+                    price_text = item.find('div', {'data-testid': 'listing-price'}).text.strip()
+                    price = int(''.join(filter(str.isdigit, price_text)))
+                    link = "https://uae.dubizzle.com" + item.find('a')['href']
+                    location = item.find('span', {'data-testid': 'listing-location'}).text.strip() if item.find('span', {'data-testid': 'listing-location'}) else "Unknown"
+                    
+                    results.append({
+                        "Timestamp": pd.Timestamp.now(),
+                        "Title": title,
+                        "Model": search_query, # Simplified for demo
+                        "Price": price,
+                        "Location": location,
+                        "Link": link
+                    })
+                except Exception:
+                    continue
+        except Exception as e:
+            st.error(f"Scrape failed: {e}")
+        finally:
+            await browser.close()
+            
+    return pd.DataFrame(results)
 
-# --- ARBITRAGE ENGINE ---
+# --- ARBITRAGE LOGIC ---
 def calculate_arbitrage(df):
-    if df.empty:
-        return df
+    if df.empty: return df
     
-    # Calculate Market Median per Model (more robust than mean)
-    market_stats = df.groupby('Model')['Price'].transform('median')
-    df['Market_Median'] = market_stats
+    median = df['Price'].median()
+    df['Market_Median'] = median
     
-    # Calculate Standard Deviation to find Z-Score (Anomalies)
-    # If only one item, std is 0. Handle edge cases.
-    std_stats = df.groupby('Model')['Price'].transform('std').fillna(1)
-    df['Z_Score'] = (df['Price'] - df['Market_Median']) / std_stats
-    
-    # ROI Calculation: Potential Profit if sold at Market Median
+    # Profit calculation
     df['Profit_AED'] = df['Market_Median'] - df['Price']
     df['ROI_%'] = (df['Profit_AED'] / df['Price']) * 100
     
+    # Simple Z-Score calculation for anomaly detection
+    std = df['Price'].std() if df['Price'].std() > 0 else 1
+    df['Z_Score'] = (df['Price'] - median) / std
+    
     return df
 
-# --- UI COMPONENTS ---
-def sidebar():
-    st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/thumb/6/69/Dubizzle_logo.svg/1200px-Dubizzle_logo.svg.png", width=150)
-    st.sidebar.title("Search Parameters")
-    cat = st.sidebar.selectbox("Category", ["iPhone", "Luxury Watches", "Gaming"])
-    roi_threshold = st.sidebar.slider("Min ROI %", 0, 50, 15)
-    max_price = st.sidebar.number_input("Max Budget (AED)", value=50000)
-    return cat, roi_threshold, max_price
-
+# --- UI MAIN ---
 def main():
-    cat, roi_threshold, max_price = sidebar()
+    st.sidebar.title("Search Parameters")
+    category = st.sidebar.selectbox("Category", ["iPhone 15 Pro", "Rolex Submariner", "PS5 Console"])
+    roi_threshold = st.sidebar.slider("Min ROI %", 0, 50, 10)
     
-    st.title(f"🔍 Dubizzle Arbitrage: {cat}")
-    st.caption("Scanning live listings for statistical price anomalies...")
+    st.title("🚀 Dubizzle Arbitrage Dashboard")
+    st.info(f"Currently monitoring: {category}")
 
-    # Fetch and Process Data
-    with st.spinner('Calculating market spreads...'):
-        # In real app: df = scrape_dubizzle(cat)
-        raw_df = get_mock_dubizzle_data(cat)
-        df = calculate_arbitrage(raw_df)
-
-    # Filter by user preferences
-    deals = df[(df['ROI_%'] >= roi_threshold) & (df['Price'] <= max_price)].sort_values(by='ROI_%', ascending=False)
-
-    # Metrics Row
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Scanned Items", len(df))
-    m2.metric("Hot Deals Found", len(deals))
-    m3.metric("Avg. Potential ROI", f"{df['ROI_%'].mean():.1f}%")
-
-    # Visualizations
-    col_left, col_right = st.columns([2, 1])
-    
-    with col_left:
-        st.subheader("📊 Market Price Distribution")
-        fig = px.box(df, x="Model", y="Price", color="Model", points="all", 
-                     title="Price Spreads (Look for outliers below the boxes)")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_right:
-        st.subheader("💡 Arbitrage Insight")
-        st.write("""
-            **The Z-Score Strategy:**
-            Items with a **Z-Score < -1.5** are priced significantly lower than their peers. 
-            Check for damage or missing accessories, then secure the flip!
-        """)
-        # Show Top ROI Table
-        st.dataframe(deals[['Title', 'Price', 'ROI_%']].head(5), hide_index=True)
-
-    # Deal Display
-    st.divider()
-    st.subheader("🔥 Live Opportunities")
-    
-    if deals.empty:
-        st.info("No deals matching your ROI threshold found. Try lowering the threshold or changing categories.")
-    else:
-        for _, row in deals.iterrows():
-            with st.container():
-                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-                with c1:
-                    st.markdown(f"**{row['Title']}**")
-                    st.caption(f"📍 {row['Location']}")
-                with c2:
-                    st.markdown(f"💰 **AED {row['Price']:,}**")
-                    st.caption(f"Mkt: AED {row['Market_Median']:,}")
-                with c3:
-                    color = "green" if row['ROI_%'] > 20 else "orange"
-                    st.markdown(f"📈 <span style='color:{color}'>**{row['ROI_%']:.1f}% ROI**</span>", unsafe_allow_html=True)
-                    st.caption(f"+AED {row['Profit_AED']:,} Profit")
-                with c4:
-                    st.link_button("View Ad", row['Link'], type="primary")
-                st.markdown("<hr style='margin: 10px 0; border:0; border-top:1px solid #eee;'>", unsafe_allow_html=True)
+    if st.button("🔍 Scan Live Market"):
+        with st.spinner("Accessing Dubizzle..."):
+            # Execute the async scraper
+            raw_data = asyncio.run(scrape_dubizzle(category))
+            
+            if not raw_data.empty:
+                df = calculate_arbitrage(raw_data)
+                
+                # Show Metrics
+                deals = df[df['ROI_%'] >= roi_threshold].sort_values(by='ROI_%', ascending=False)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Items Scanned", len(df))
+                m2.metric("Hot Deals Found", len(deals))
+                m3.metric("Market Median", f"AED {df['Market_Median'].iloc[0]:,.0f}")
+                
+                # Plot
+                fig = px.histogram(df, x="Price", title="Market Price Distribution", color_discrete_sequence=['#ff4b4b'])
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Results List
+                st.subheader("🔥 Top Deals Identified")
+                if deals.empty:
+                    st.warning("No deals found matching your ROI criteria.")
+                else:
+                    for _, row in deals.iterrows():
+                        with st.container():
+                            c1, c2, c3 = st.columns([3, 1, 1])
+                            c1.markdown(f"**{row['Title']}**\n\n📍 {row['Location']}")
+                            c2.markdown(f"💰 **AED {row['Price']:,}**\n\nROI: {row['ROI_%']:.1f}%")
+                            c3.link_button("View Ad", row['Link'], type="primary")
+                            st.divider()
+            else:
+                st.error("No data returned. Dubizzle may be blocking the request. Try a different search term.")
 
 if __name__ == "__main__":
     main()
